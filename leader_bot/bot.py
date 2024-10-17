@@ -1,7 +1,6 @@
 import json
 import os
 import sys
-
 from datetime import datetime
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -9,9 +8,9 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import aiohttp
 import discord
 from discord import app_commands
-
 from discord.ext import tasks
-from datetime import datetime
+from discord.ui import Button, View, Modal, TextInput
+from discord import ButtonStyle
 
 import config
 from log_config import get_logger
@@ -58,23 +57,319 @@ task_details = {}
 
 AUTH_TOKEN = config.SHARED_SECRET
 
+# Unique identifier to manage button messages
+BUTTON_MESSAGE_IDENTIFIER = "Admin Commands"
 
+
+class ViewLeaderboardModal(Modal):
+    def __init__(self):
+        super().__init__(title="View Leaderboard")
+        self.thread_id = TextInput(
+            label="Thread ID", style=discord.TextStyle.short, required=True
+        )
+        self.date = TextInput(
+            label="Date (YYYY-MM)", style=discord.TextStyle.short, required=False
+        )
+        self.add_item(self.thread_id)
+        self.add_item(self.date)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        thread_id = self.thread_id.value
+        date = self.date.value
+
+        try:
+            thread = await interaction.guild.fetch_channel(thread_id)
+            if not isinstance(thread, discord.Thread):
+                raise ValueError("The provided ID does not belong to a thread.")
+
+            if date:
+                year, month = date.split("-")
+            else:
+                now = datetime.now()
+                formatted_date = now.strftime("%Y-%m")
+                year, month = formatted_date.split("-")
+
+            leaderboard = create_leaderboard_by_month(year, month)
+            messages = format_leaderboard_for_discord(leaderboard)
+
+            bot_user_id = interaction.client.user.id
+            async for message in thread.history(limit=None):
+                if message.author.id == bot_user_id:
+                    await message.delete()
+
+            for msg in messages:
+                await thread.send(msg)
+
+            await interaction.response.send_message(
+                f"Posted to {thread_id} successfully.", ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in ViewLeaderboardModal: {e}")
+            await interaction.response.send_message(
+                f"Please check your input: {e}", ephemeral=True
+            )
+
+
+class GetUserMonthlyDataModal(Modal):
+    def __init__(self):
+        super().__init__(title="Get User Monthly Data to CSV")
+        self.username = TextInput(
+            label="Username", style=discord.TextStyle.short, required=True
+        )
+        self.date = TextInput(
+            label="Date (YYYY-MM)", style=discord.TextStyle.short, required=True
+        )
+        self.add_item(self.username)
+        self.add_item(self.date)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        username = self.username.value
+        date = self.date.value
+
+        try:
+            file_path = f"user_monthly_data_{username}_{date}.csv"
+            result = write_all_data_of_user_to_csv_by_month(file_path, username, date)
+            if "successfully" in result:
+                await interaction.channel.send(file=discord.File(file_path))
+                os.remove(file_path)
+                await interaction.followup.send(
+                    "User monthly data is here:", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "User monthly data is not found", ephemeral=True
+                )
+        except Exception as e:
+            logger.error(f"Error in GetUserMonthlyDataModal: {e}")
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+
+
+class GetMonthlyStreaksModal(Modal):
+    def __init__(self):
+        super().__init__(title="Get Monthly Streaks")
+        self.date = TextInput(
+            label="Date (YYYY-MM)", style=discord.TextStyle.short, required=True
+        )
+        self.add_item(self.date)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        date = self.date.value
+
+        try:
+            month_name = datetime.strptime(date, "%Y-%m").strftime("%B")
+            streaks = calculate_monthly_streak(date)
+
+            messages = format_streaks_for_discord(streaks, month_name)
+            thread_title = f"Streaks | {date}"
+
+            forum_channel_id = int(config.LEADERBOARD_FORUM_CHANNEL_ID)
+            forum_channel = interaction.guild.get_channel(forum_channel_id)
+            if not forum_channel:
+                raise ValueError("Leaderboard forum channel not found.")
+
+            thread, _ = await forum_channel.create_thread(
+                name=thread_title, content=messages[0]
+            )
+
+            for msg in messages[1:]:
+                await thread.send(msg)
+
+            await interaction.followup.send(
+                f"Streaks thread created: {thread.jump_url}", ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in GetMonthlyStreaksModal: {e}")
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+
+
+# Define the AdminCommandsView with the desired buttons
+class AdminCommandsView(View):
+    def __init__(self):
+        super().__init__(timeout=None)  # Persistent view
+        self.add_item(
+            Button(
+                label="Get User Monthly Data to CSV",
+                style=ButtonStyle.primary,
+                custom_id="get_user_monthly_data_to_csv_1",  # Ensure unique custom_id
+            )
+        )
+        self.add_item(
+            Button(
+                label="Get Blockchain Summary",
+                style=ButtonStyle.primary,
+                custom_id="get_blockchain_summary_2",  # Ensure unique custom_id
+            )
+        )
+        self.add_item(
+            Button(
+                label="Get All Data to CSV",
+                style=ButtonStyle.secondary,
+                custom_id="get_all_data_to_csv_3",  # Ensure unique custom_id
+            )
+        )
+        self.add_item(
+            Button(
+                label="Get Monthly Streaks",
+                style=ButtonStyle.success,
+                custom_id="get_monthly_streaks_4",  # Ensure unique custom_id
+            )
+        )
+        self.add_item(
+            Button(
+                label="Leaderboard View",
+                style=ButtonStyle.success,
+                custom_id="leaderboard_view_5",  # Ensure unique custom_id
+            )
+        )
+
+    # Callback for "Get User Monthly Data to CSV" button
+    async def get_user_monthly_data_to_csv_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = GetUserMonthlyDataModal()
+        await interaction.response.send_modal(modal)
+
+    # Callback for "Get Blockchain Summary" button
+    async def get_blockchain_summary_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        try:
+            await interaction.response.defer()
+
+            url = "https://api.minaexplorer.com/summary"
+            headers = {}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers) as response:
+                    response_data = await response.json()
+
+            res = json.dumps(response_data, indent=4)
+            discord_message = f"```\n{res}\n```"
+
+            await interaction.followup.send(discord_message, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error in get_blockchain_summary_button: {e}")
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+
+    # Callback for "Get All Data to CSV" button
+    async def get_all_data_to_csv_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        try:
+            await interaction.response.defer()
+
+            file_path = "all_data.csv"
+            result = write_users_to_csv(file_path)
+            if "successfully" in result:
+                await interaction.channel.send(file=discord.File(file_path))
+                os.remove(file_path)
+                await interaction.followup.send("All data is here:", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "Failed to retrieve all data.", ephemeral=True
+                )
+        except Exception as e:
+            logger.error(f"Error in get_all_data_to_csv_button: {e}")
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+
+    # Callback for "Get Monthly Streaks" button
+    async def get_monthly_streaks_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = GetMonthlyStreaksModal()
+        await interaction.response.send_modal(modal)
+
+    # Callback for "Leaderboard View" button
+    async def leaderboard_view_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = ViewLeaderboardModal()
+        await interaction.response.send_modal(modal)
+
+
+# Event: on_ready
 @client.event
 async def on_ready():
     try:
         await tree.sync(guild=discord.Object(id=config.GUILD_ID))
         logger.info(f"We have logged in as {client.user}")
+
+        # Register the view for persistent interactions
+        client.add_view(AdminCommandsView())
+
+        # Fetch the test-admin channel
+        test_admin_channel = client.get_channel(int(config.TEST_ADMIN_CHANNEL_ID))
+        if test_admin_channel:
+            # Delete existing button messages to prevent duplicates
+            async for message in test_admin_channel.history(limit=100):
+                if message.author == client.user:
+                    # Check if the message has the identifier in its content or embed
+                    if message.content.startswith(BUTTON_MESSAGE_IDENTIFIER) or (
+                        message.embeds
+                        and message.embeds[0].title == BUTTON_MESSAGE_IDENTIFIER
+                    ):
+                        await message.delete()
+                        logger.info(f"Deleted old button message with ID: {message.id}")
+
+            # Send a new button message with a unique identifier
+            embed = discord.Embed(
+                title=BUTTON_MESSAGE_IDENTIFIER,
+                description="Use the buttons below to execute admin commands.",
+                color=discord.Color.blue(),
+            )
+            await test_admin_channel.send(embed=embed, view=AdminCommandsView())
+            logger.info("Admin commands view sent to test-admin channel.")
+        else:
+            logger.error(
+                "Test-admin channel not found. Please check the TEST_ADMIN_CHANNEL_ID."
+            )
     except Exception as e:
         logger.error(f"Error during on_ready: {e}")
 
+    # Start the background task
+    refresh_admin_buttons.start()
 
+
+# Event: on_message
 @client.event
 async def on_message(message):
     try:
         if message.author == client.user:
             return
+        # Add any additional on_message logic here if needed
     except Exception as e:
         logger.error(f"Error processing message: {e}")
+
+
+# Define a background task to periodically refresh the button message if needed
+@tasks.loop(hours=1)
+async def refresh_admin_buttons():
+    try:
+        test_admin_channel = client.get_channel(int(config.TEST_ADMIN_CHANNEL_ID))
+        if test_admin_channel:
+            # Delete existing button messages
+            async for message in test_admin_channel.history(limit=100):
+                if message.author == client.user:
+                    if message.content.startswith(BUTTON_MESSAGE_IDENTIFIER) or (
+                        message.embeds
+                        and message.embeds[0].title == BUTTON_MESSAGE_IDENTIFIER
+                    ):
+                        await message.delete()
+                        logger.info(f"Deleted old button message with ID: {message.id}")
+
+            # Send a new button message
+            embed = discord.Embed(
+                title=BUTTON_MESSAGE_IDENTIFIER,
+                description="Use the buttons below to execute admin commands.",
+                color=discord.Color.blue(),
+            )
+            await test_admin_channel.send(embed=embed, view=AdminCommandsView())
+            logger.info("Refreshed admin commands view in test-admin channel.")
+    except Exception as e:
+        logger.error(f"Error in refresh_admin_buttons task: {e}")
+
+
+# Define Slash Commands with Unique Function Names
 
 
 @tree.command(
@@ -82,7 +377,7 @@ async def on_message(message):
     description="It will create a google sheet with the contributions data",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(
+async def commits_sheet_create_command(
     interaction: discord.Interaction, spreadsheet_name: str, email_address: str = None
 ):
     global spread_sheet_id
@@ -112,7 +407,9 @@ async def on_command(
     description="It will update the google sheet with the updated contributions data",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(interaction: discord.Interaction, spreadsheet_id: str):
+async def commits_sheet_update_command(
+    interaction: discord.Interaction, spreadsheet_id: str
+):
     global spread_sheet_id
     try:
         await interaction.response.defer()
@@ -138,7 +435,7 @@ async def on_command(interaction: discord.Interaction, spreadsheet_id: str):
     description="Edit Google Sheets from Discord",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(interaction: discord.Interaction, operation: str):
+async def main_sheet_edit_command(interaction: discord.Interaction, operation: str):
     try:
         if operation not in ["insert", "update", "add_repo", "delete"]:
             await interaction.followup.send(
@@ -150,7 +447,7 @@ async def on_command(interaction: discord.Interaction, operation: str):
         modal = UserModal(operation=operation)
         await interaction.response.send_modal(modal)
     except Exception as e:
-        logger.error(f"Error in main-sheet-edit command: {e}")
+        logger.error(f"Error in main_sheet_edit_command: {e}")
         await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
@@ -159,7 +456,7 @@ async def on_command(interaction: discord.Interaction, operation: str):
     description="It will create or update leaderboard",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(
+async def leaderboard_create_command(
     interaction: discord.Interaction, spreadsheet_id: str = None, date: str = None
 ):
     global spread_sheet_id
@@ -182,7 +479,7 @@ async def on_command(
         for msg in messages:
             await interaction.followup.send(msg, ephemeral=True)
     except Exception as e:
-        logger.error(f"Error in leaderboard-create command: {e}")
+        logger.error(f"Error in leaderboard_create_command: {e}")
         await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
@@ -191,7 +488,7 @@ async def on_command(
     description="It will show leaderboard in the discord channel",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(
+async def leaderboard_view_command(
     interaction: discord.Interaction, thread_id: str, date: str = None
 ):
     await interaction.response.defer()
@@ -225,7 +522,7 @@ async def on_command(
         )
 
     except Exception as e:
-        logger.error(f"Error in leaderboard-view command: {e}")
+        logger.error(f"Error in leaderboard_view_command: {e}")
         await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
 
 
@@ -234,7 +531,7 @@ async def on_command(
     description="It will automatically post the leaderboard every day at a specified time",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(
+async def leaderboard_start_auto_post_command(
     interaction: discord.Interaction, date: str, time: str, spreadsheet_id: str = None
 ):
     global auto_post_task, task_details
@@ -272,7 +569,7 @@ async def on_command(
             f"Auto-post leaderboard task started for {date} at {time}.", ephemeral=True
         )
     except Exception as e:
-        logger.error(f"Error in leaderboard-start-auto-post command: {e}")
+        logger.error(f"Error in leaderboard_start_auto_post_command: {e}")
         await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
@@ -281,7 +578,9 @@ async def on_command(
     description="It will stop the auto-post leaderboard task for a specific date (YYYY-MM)",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def leaderboard_stop_auto_post(interaction: discord.Interaction, date: str):
+async def leaderboard_stop_auto_post_command(
+    interaction: discord.Interaction, date: str
+):
     try:
         await interaction.response.defer()
 
@@ -296,7 +595,7 @@ async def leaderboard_stop_auto_post(interaction: discord.Interaction, date: str
                 ephemeral=True,
             )
     except Exception as e:
-        logger.error(f"Error in leaderboard-stop-auto-post command: {e}")
+        logger.error(f"Error in leaderboard_stop_auto_post_command: {e}")
         await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
@@ -334,7 +633,7 @@ def auto_post_leaderboard(task_id):
     description="It will create forum thread for leaderboard in the discord forum channel",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(
+async def leaderboard_closure_month_command(
     interaction: discord.Interaction, date: str = None, commit_filter: int = 10
 ):
     await interaction.response.defer()
@@ -377,7 +676,7 @@ async def on_command(
         )
 
     except Exception as e:
-        logger.error(f"Error in leaderboard-closure-month: {e}")
+        logger.error(f"Error in leaderboard_closure_month_command: {e}")
         await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
 
 
@@ -386,7 +685,9 @@ async def on_command(
     description="Gets monthly streaks of users and sends it to channel.",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(interaction: discord.Integration, date: str = None):
+async def get_monthly_streaks_command(
+    interaction: discord.Interaction, date: str = None
+):
     try:
         await interaction.response.defer()
 
@@ -420,7 +721,7 @@ async def on_command(interaction: discord.Integration, date: str = None):
         )
 
     except Exception as e:
-        logger.error(f"Error in get monthly streaks command: {e}")
+        logger.error(f"Error in get_monthly_streaks_command: {e}")
         await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
 
 
@@ -429,7 +730,7 @@ async def on_command(interaction: discord.Integration, date: str = None):
     description="Get and insert all members of the guild to the db in new collection",
     guild=discord.Object(id=config.GUILD_ID),
 )
-async def on_command(interaction: discord.Interaction):
+async def get_members_and_insert_to_db_command(interaction: discord.Interaction):
     await interaction.response.defer()
     channel = interaction.channel
 
@@ -441,8 +742,8 @@ async def on_command(interaction: discord.Interaction):
         if result:
             await interaction.followup.send(f"Users successfully inserted")
     except Exception as e:
-        logger.error(f"An error occured: {e}")
-        await interaction.followup.send(f"An error occured: {e}", ephemeral=True)
+        logger.error(f"An error occurred in get_members_and_insert_to_db_command: {e}")
+        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 def convert_to_iso8601(date_str):
@@ -457,198 +758,5 @@ async def fetch(session, url, method="GET", data=None, params=None):
         return await response.json()
 
 
-@tree.command(
-    name="run-task",
-    description="Run the task for a specific timeframe.",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def run_task_for_user(interaction: discord.Interaction, since: str, until: str):
-    try:
-        since = convert_to_iso8601(since)
-        until = convert_to_iso8601(until)
-
-        await interaction.response.defer()
-        url = f"{config.GTP_ENDPOINT}/run-task"
-        payload = {"since": since, "until": until}
-        headers = {"Authorization": AUTH_TOKEN}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload, headers=headers) as response:
-                response_data = await response.json()
-
-        await interaction.followup.send(response_data["message"])
-    except Exception as e:
-        logger.error(f"Error in run-task-for-user command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="run-task-for-user",
-    description="Run the task for a specific user with the specified time frame",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def run_task_for_user(
-    interaction: discord.Interaction, username: str, since: str, until: str
-):
-    try:
-        since = convert_to_iso8601(since)
-        until = convert_to_iso8601(until)
-
-        await interaction.response.defer()
-        url = f"{config.GTP_ENDPOINT}/run-task-for-user"
-        payload = {"since": since, "until": until}
-        params = {"username": username}
-        headers = {"Authorization": AUTH_TOKEN}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload, params=params, headers=headers
-            ) as response:
-                response_data = await response.json()
-
-        await interaction.followup.send(response_data["message"])
-    except Exception as e:
-        logger.error(f"Error in run-task-for-user command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="control-scheduler",
-    description="Control the scheduler (start/stop) with an optional interval",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def control_scheduler(
-    interaction: discord.Interaction, action: str, interval: int = 1
-):
-    try:
-        await interaction.response.defer()
-        url = f"{config.GTP_ENDPOINT}/control-scheduler"
-        payload = {"action": action, "interval_minutes": interval}
-        headers = {"Authorization": AUTH_TOKEN}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                url, json=payload, params=None, headers=headers
-            ) as response:
-                response_data = await response.json()
-
-        await interaction.followup.send(response_data["message"])
-    except Exception as e:
-        logger.error(f"Error in control-scheduler command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="get-ai-decisions-by-user",
-    description="Gets AI decisions as csv file for specific user between given dates.",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def on_command(
-    interaction: discord.Interaction, username: str, since: str, until: str
-):
-    try:
-        await interaction.response.defer()
-        ai_decisions = get_ai_decisions_by_user_and_timeframe(username, since, until)
-
-        file_path = f"ai_decisions_by_user_{username}.csv"
-        result = write_ai_decisions_to_csv(file_path, ai_decisions)
-        if "successful" in result:
-            await interaction.channel.send(file=discord.File(file_path))
-            os.remove(file_path)
-
-        await interaction.followup.send("AI decisions here: ", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in get-ai-decisions-by-user command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="get-all-data-to-csv",
-    description="Gets all db data and export it to csv.",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def on_command(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer()
-
-        file_path = "all_data.csv"
-        result = write_users_to_csv(file_path)
-        if "successfully" in result:
-            await interaction.channel.send(file=discord.File(file_path))
-            os.remove(file_path)
-
-        await interaction.followup.send("All data is here: ", ephemeral=True)
-    except Exception as e:
-        logger.error(f"Error in get-all-data-to-csv command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="get-blockchain-summary",
-    description="Gets MINA Blockchain summary",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def on_command(interaction: discord.Interaction):
-    try:
-        await interaction.response.defer()
-
-        url = "https://api.minaexplorer.com/summary"
-        headers = {}
-
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
-                response_data = await response.json()
-
-        res = json.dumps(response_data, indent=4)
-        discord_message = f"```\n{res}\n```"
-
-        await interaction.followup.send(discord_message)
-    except Exception as e:
-        logger.error(f"Error in get-blockchain-summary command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="get-user-monthly-data-to-csv",
-    description="Gets all db data for specific user for a month and export it to csv.",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def on_command(interaction: discord.Interaction, username: str, date: str):
-    try:
-        await interaction.response.defer()
-
-        file_path = "user_monthly_data.csv"
-        result = write_all_data_of_user_to_csv_by_month(file_path, username, date)
-        if "successfully" in result:
-            await interaction.channel.send(file=discord.File(file_path))
-            os.remove(file_path)
-            await interaction.followup.send(
-                "User monthly data is here: ", ephemeral=True
-            )
-        else:
-            await interaction.followup.send(
-                "User monthly data is not found", ephemeral=True
-            )
-    except Exception as e:
-        logger.error(f"Error in get-user-monthly-data-to-csv command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-
-
-@tree.command(
-    name="delete-all-data",
-    description="Deletes all data between specific dates.",
-    guild=discord.Object(id=config.GUILD_ID),
-)
-async def on_command(interaction: discord.Interaction, from_date: str, until_date: str):
-    try:
-        modal = UserDeletionModal(from_date=from_date, until_date=until_date)
-        await interaction.response.send_modal(modal)
-
-    except Exception as e:
-        logger.error(f"Error in on_command: {e}")
-        await interaction.followup.send(
-            "Something went wrong while processing the command.", ephemeral=True
-        )
-
-
+# Run the bot
 client.run(config.DISCORD_TOKEN)
