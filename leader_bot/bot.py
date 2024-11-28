@@ -3,15 +3,17 @@ import os
 import sys
 from datetime import datetime
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import tasks
-from discord.ui import Button, View, Modal, TextInput
+from discord.ui import View, Modal, TextInput
 from discord import ButtonStyle
 
+# Ensure that your project's root directory is in the sys.path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+# Import your custom modules
 import config
 from log_config import get_logger
 from sheet_functions import (
@@ -35,9 +37,6 @@ from db_functions import (
     get_ai_decisions_by_user_and_timeframe,
     calculate_monthly_streak,
 )
-from modals import UserModal, UserDeletionModal
-from helpers import csv_to_structured_string
-import utils
 
 logger = get_logger(__name__)
 
@@ -51,10 +50,6 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 spread_sheet_id = None
-auto_post_task = None
-auto_post_tasks = {}
-task_details = {}
-
 AUTH_TOKEN = config.SHARED_SECRET
 
 # Unique identifier to manage button messages
@@ -101,14 +96,21 @@ class ViewLeaderboardModal(Modal):
             for msg in messages:
                 await thread.send(msg)
 
+            # Respond to the interaction
             await interaction.response.send_message(
-                f"Posted to {thread_id} successfully.", ephemeral=True
+                f"Posted to {thread.url} successfully.", ephemeral=True
             )
+
         except Exception as e:
             logger.error(f"Error in ViewLeaderboardModal: {e}")
-            await interaction.response.send_message(
-                f"Please check your input: {e}", ephemeral=True
-            )
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
 
 
 class GetUserMonthlyDataModal(Modal):
@@ -133,16 +135,23 @@ class GetUserMonthlyDataModal(Modal):
             if "successfully" in result.lower():
                 await interaction.channel.send(file=discord.File(file_path))
                 os.remove(file_path)
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     "User monthly data is here:", ephemeral=True
                 )
             else:
-                await interaction.followup.send(
+                await interaction.response.send_message(
                     "User monthly data is not found.", ephemeral=True
                 )
         except Exception as e:
             logger.error(f"Error in GetUserMonthlyDataModal: {e}")
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
 
 
 class GetMonthlyStreaksModal(Modal):
@@ -175,12 +184,342 @@ class GetMonthlyStreaksModal(Modal):
             for msg in messages[1:]:
                 await thread.send(msg)
 
-            await interaction.followup.send(
-                f"Streaks thread created: {thread.jump_url}", ephemeral=True
+            await interaction.response.send_message(
+                f"Streaks thread created: {thread.url}", ephemeral=True
             )
         except Exception as e:
             logger.error(f"Error in GetMonthlyStreaksModal: {e}")
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class LeaderboardClosureMonthModal(Modal):
+    def __init__(self):
+        super().__init__(title="Leaderboard Closure Month")
+        self.date = TextInput(
+            label="Date (YYYY-MM)", style=discord.TextStyle.short, required=True
+        )
+        self.commit_filter = TextInput(
+            label="Commit Filter (integer)",
+            style=discord.TextStyle.short,
+            required=False,
+            default="10",
+        )
+        self.add_item(self.date)
+        self.add_item(self.commit_filter)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        date = self.date.value
+        commit_filter = self.commit_filter.value
+
+        try:
+            commit_filter = int(commit_filter)
+            month_name = datetime.strptime(date, "%Y-%m").strftime("%B")
+            leaderboard = create_leaderboard_by_month(
+                date.split("-")[0], date.split("-")[1], commit_filter
+            )
+            messages = format_leaderboard_for_discord(
+                leaderboard, date, include_commits=True
+            )
+            thread_title = f"Leaderboard Closure | {date}"
+
+            forum_channel_id = int(config.LEADERBOARD_FORUM_CHANNEL_ID)
+            forum_channel = interaction.guild.get_channel(forum_channel_id)
+            if not forum_channel:
+                raise ValueError("Leaderboard forum channel not found.")
+
+            thread = await forum_channel.create_thread(
+                name=thread_title, content=messages[0]
+            )
+
+            for msg in messages[1:]:
+                await thread.send(msg)
+
+            file_path = "user_data.csv"
+            result = write_users_to_csv_monthly(file_path, date)
+
+            if "successfully" in result.lower():
+                await thread.send(file=discord.File(file_path))
+                os.remove(file_path)
+
+            await interaction.response.send_message(
+                f"Leaderboard thread created: {thread.url}", ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in LeaderboardClosureMonthModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class RunTaskModal(Modal):
+    def __init__(self):
+        super().__init__(title="Run Task")
+        self.since = TextInput(
+            label="Since Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.until = TextInput(
+            label="Until Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.add_item(self.since)
+        self.add_item(self.until)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        since = self.since.value
+        until = self.until.value
+
+        try:
+            since_iso = convert_to_iso8601(since)
+            until_iso = convert_to_iso8601(until)
+
+            await interaction.response.defer(ephemeral=True)
+            url = f"{config.GTP_ENDPOINT}/run-task"
+            payload = {"since": since_iso, "until": until_iso}
+            headers = {"Authorization": AUTH_TOKEN}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    response_data = await response.json()
+
+            await interaction.followup.send(
+                response_data.get("message", "Task completed."), ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in RunTaskModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class RunTaskForUserModal(Modal):
+    def __init__(self):
+        super().__init__(title="Run Task for User")
+        self.username = TextInput(
+            label="Username",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.since = TextInput(
+            label="Since Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.until = TextInput(
+            label="Until Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.add_item(self.username)
+        self.add_item(self.since)
+        self.add_item(self.until)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        username = self.username.value
+        since = self.since.value
+        until = self.until.value
+
+        try:
+            since_iso = convert_to_iso8601(since)
+            until_iso = convert_to_iso8601(until)
+
+            await interaction.response.defer(ephemeral=True)
+            url = f"{config.GTP_ENDPOINT}/run-task-for-user"
+            payload = {"since": since_iso, "until": until_iso}
+            params = {"username": username}
+            headers = {"Authorization": AUTH_TOKEN}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url, json=payload, params=params, headers=headers
+                ) as response:
+                    response_data = await response.json()
+
+            await interaction.followup.send(
+                response_data.get("message", "Task for user completed."), ephemeral=True
+            )
+        except Exception as e:
+            logger.error(f"Error in RunTaskForUserModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class ControlSchedulerModal(Modal):
+    def __init__(self):
+        super().__init__(title="Control Scheduler")
+        self.action = TextInput(
+            label="Action (start/stop)",
+            style=discord.TextStyle.short,
+            required=True,
+            default="start",
+        )
+        self.interval = TextInput(
+            label="Interval in Minutes (optional, default=1)",
+            style=discord.TextStyle.short,
+            required=False,
+            default="1",
+        )
+        self.add_item(self.action)
+        self.add_item(self.interval)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        action = self.action.value.lower()
+        interval = self.interval.value or "1"
+
+        try:
+            interval = int(interval)
+            if action not in ["start", "stop"]:
+                raise ValueError("Action must be 'start' or 'stop'.")
+
+            await interaction.response.defer(ephemeral=True)
+            url = f"{config.GTP_ENDPOINT}/control-scheduler"
+            payload = {"action": action, "interval_minutes": interval}
+            headers = {"Authorization": AUTH_TOKEN}
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    response_data = await response.json()
+
+            await interaction.followup.send(
+                response_data.get("message", "Scheduler action completed."),
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Error in ControlSchedulerModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class GetAIDecisionsByUserModal(Modal):
+    def __init__(self):
+        super().__init__(title="Get AI Decisions by User")
+        self.username = TextInput(
+            label="Username",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.since = TextInput(
+            label="Since Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.until = TextInput(
+            label="Until Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+        )
+        self.add_item(self.username)
+        self.add_item(self.since)
+        self.add_item(self.until)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        username = self.username.value
+        since = self.since.value
+        until = self.until.value
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+            ai_decisions = get_ai_decisions_by_user_and_timeframe(
+                username, since, until
+            )
+
+            file_path = f"ai_decisions_by_user_{username}.csv"
+            result = write_ai_decisions_to_csv(file_path, ai_decisions)
+            if "successful" in result.lower():
+                await interaction.channel.send(file=discord.File(file_path))
+                os.remove(file_path)
+
+                await interaction.followup.send("AI decisions here:", ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    "AI decisions data not found or failed to write.", ephemeral=True
+                )
+        except Exception as e:
+            logger.error(f"Error in GetAIDecisionsByUserModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+
+class DeleteAllDataModal(Modal):
+    def __init__(self, from_date: str = "", until_date: str = ""):
+        super().__init__(title="Delete All Data")
+        self.from_date = TextInput(
+            label="From Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+            default=from_date,
+        )
+        self.until_date = TextInput(
+            label="Until Date (YYYY-MM-DD)",
+            style=discord.TextStyle.short,
+            required=True,
+            default=until_date,
+        )
+        self.add_item(self.from_date)
+        self.add_item(self.until_date)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        from_date = self.from_date.value
+        until_date = self.until_date.value
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+            # Implement your data deletion logic here
+            # For example:
+            # delete_data_between_dates(from_date, until_date)
+
+            # Assuming the deletion was successful
+            await interaction.followup.send(
+                f"All data between {from_date} and {until_date} has been deleted.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.error(f"Error in DeleteAllDataModal: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
 
 
 # Define the AdminCommandsView with the desired buttons
@@ -191,7 +530,7 @@ class AdminCommandsView(View):
     @discord.ui.button(
         label="Get User Monthly Data to CSV",
         style=ButtonStyle.primary,
-        custom_id="get_user_monthly_data_to_csv_1",  # Ensure unique custom_id
+        custom_id="get_user_monthly_data_to_csv_1",
     )
     async def get_user_monthly_data_to_csv_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -202,7 +541,7 @@ class AdminCommandsView(View):
     @discord.ui.button(
         label="Get Blockchain Summary",
         style=ButtonStyle.primary,
-        custom_id="get_blockchain_summary_2",  # Ensure unique custom_id
+        custom_id="get_blockchain_summary_2",
     )
     async def get_blockchain_summary_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -223,12 +562,19 @@ class AdminCommandsView(View):
             await interaction.followup.send(discord_message, ephemeral=True)
         except Exception as e:
             logger.error(f"Error in get_blockchain_summary_button: {e}")
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
 
     @discord.ui.button(
         label="Get All Data to CSV",
         style=ButtonStyle.secondary,
-        custom_id="get_all_data_to_csv_3",  # Ensure unique custom_id
+        custom_id="get_all_data_to_csv_3",
     )
     async def get_all_data_to_csv_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -248,12 +594,19 @@ class AdminCommandsView(View):
                 )
         except Exception as e:
             logger.error(f"Error in get_all_data_to_csv_button: {e}")
-            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
 
     @discord.ui.button(
         label="Get Monthly Streaks",
         style=ButtonStyle.success,
-        custom_id="get_monthly_streaks_4",  # Ensure unique custom_id
+        custom_id="get_monthly_streaks_4",
     )
     async def get_monthly_streaks_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -264,12 +617,111 @@ class AdminCommandsView(View):
     @discord.ui.button(
         label="Leaderboard View",
         style=ButtonStyle.success,
-        custom_id="leaderboard_view_5",  # Ensure unique custom_id
+        custom_id="leaderboard_view_5",
     )
     async def leaderboard_view_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         modal = ViewLeaderboardModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Leaderboard Closure Month",
+        style=ButtonStyle.success,
+        custom_id="leaderboard_closure_month_6",
+    )
+    async def leaderboard_closure_month_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = LeaderboardClosureMonthModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Get Members and Insert to DB",
+        style=ButtonStyle.primary,
+        custom_id="get_members_and_insert_to_db_7",
+    )
+    async def get_members_and_insert_to_db_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        try:
+            await interaction.response.defer(ephemeral=True)
+            members = interaction.guild.members
+            member_list = [{member.name: member.id} for member in members]
+            logger.info(member_list)
+            result = insert_discord_users(member_list)
+            if result:
+                await interaction.followup.send(
+                    "Users successfully inserted into the database.", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    "Failed to insert users into the database.", ephemeral=True
+                )
+        except Exception as e:
+            logger.error(f"Error in get_members_and_insert_to_db_button: {e}")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    f"An error occurred: {e}", ephemeral=True
+                )
+
+    @discord.ui.button(
+        label="Run Task",
+        style=ButtonStyle.primary,
+        custom_id="run_task_8",
+    )
+    async def run_task_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = RunTaskModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Run Task for User",
+        style=ButtonStyle.primary,
+        custom_id="run_task_for_user_9",
+    )
+    async def run_task_for_user_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = RunTaskForUserModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Control Scheduler",
+        style=ButtonStyle.primary,
+        custom_id="control_scheduler_10",
+    )
+    async def control_scheduler_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = ControlSchedulerModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Get AI Decisions by User",
+        style=ButtonStyle.primary,
+        custom_id="get_ai_decisions_by_user_11",
+    )
+    async def get_ai_decisions_by_user_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = GetAIDecisionsByUserModal()
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Delete All Data",
+        style=ButtonStyle.danger,
+        custom_id="delete_all_data_12",
+    )
+    async def delete_all_data_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        modal = DeleteAllDataModal()
         await interaction.response.send_modal(modal)
 
 
@@ -286,7 +738,7 @@ async def on_ready():
         # Fetch the admin channel
         admin_channel_id = int(
             config.TEST_ADMIN_CHANNEL_ID
-        )  # Update with your admin channel ID
+        )  # Ensure this ID is correct
         admin_channel = client.get_channel(admin_channel_id)
         if admin_channel:
             # Delete existing button messages to prevent duplicates
@@ -309,7 +761,7 @@ async def on_ready():
             logger.info("Admin commands view sent to admin channel.")
         else:
             logger.error(
-                "Admin channel not found. Please check the TEST_ADMIN_CHANNEL_ID."
+                "Admin channel not found. Please check the TEST_ADMIN_CHANNEL_ID in config."
             )
     except Exception as e:
         logger.error(f"Error during on_ready: {e}")
@@ -324,7 +776,7 @@ async def refresh_admin_buttons():
     try:
         admin_channel_id = int(
             config.TEST_ADMIN_CHANNEL_ID
-        )  # Update with your admin channel ID
+        )  # Ensure this ID is correct
         admin_channel = client.get_channel(admin_channel_id)
         if admin_channel:
             # Delete existing button messages
@@ -347,13 +799,13 @@ async def refresh_admin_buttons():
             logger.info("Refreshed admin commands view in admin channel.")
         else:
             logger.error(
-                "Admin channel not found. Please check the TEST_ADMIN_CHANNEL_ID."
+                "Admin channel not found. Please check the TEST_ADMIN_CHANNEL_ID in config."
             )
     except Exception as e:
         logger.error(f"Error in refresh_admin_buttons task: {e}")
 
 
-# Event: on_message
+# Event: on_message (optional, if you have additional logic)
 @client.event
 async def on_message(message):
     try:
@@ -515,12 +967,19 @@ async def leaderboard_view_command(
             await thread.send(msg)
 
         await interaction.followup.send(
-            f"Posted to thread ID `{thread_id}` successfully.", ephemeral=True
+            f"Posted to thread ID `{thread.url}` successfully.", ephemeral=True
         )
 
     except Exception as e:
         logger.error(f"Error in leaderboard_view_command: {e}")
-        await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"Please check your input: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Please check your input: {e}", ephemeral=True
+            )
 
 
 @tree.command(
@@ -550,10 +1009,12 @@ async def leaderboard_closure_month_command(
             year, month = formatted_date.split("-")
 
         leaderboard = create_leaderboard_by_month(year, month, commit_filter)
-        messages = format_leaderboard_for_discord(leaderboard, date, True)
+        messages = format_leaderboard_for_discord(
+            leaderboard, date, include_commits=True
+        )
         month_name = date_obj.strftime("%B")
 
-        thread_title = f"Leaderboard | {year} {month_name}"
+        thread_title = f"Leaderboard Closure | {date}"
         thread = await forum_channel.create_thread(
             name=thread_title, content=messages[0]
         )
@@ -569,12 +1030,19 @@ async def leaderboard_closure_month_command(
             os.remove(file_path)
 
         await interaction.followup.send(
-            f"Leaderboard thread created: {thread.jump_url}", ephemeral=True
+            f"Leaderboard thread created: {thread.url}", ephemeral=True
         )
 
     except Exception as e:
         logger.error(f"Error in leaderboard_closure_month_command: {e}")
-        await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"Please check your input: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Please check your input: {e}", ephemeral=True
+            )
 
 
 @tree.command(
@@ -616,12 +1084,19 @@ async def get_monthly_streaks_command(
             await thread.send(msg)
 
         await interaction.followup.send(
-            f"Streaks thread created: {thread.jump_url}", ephemeral=True
+            f"Streaks thread created: {thread.url}", ephemeral=True
         )
 
     except Exception as e:
         logger.error(f"Error in get_monthly_streaks_command: {e}")
-        await interaction.followup.send(f"Please check your input: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"Please check your input: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"Please check your input: {e}", ephemeral=True
+            )
 
 
 @tree.command(
@@ -648,7 +1123,12 @@ async def get_members_and_insert_to_db_command(interaction: discord.Interaction)
             )
     except Exception as e:
         logger.error(f"Error in get_members_and_insert_to_db_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -675,7 +1155,12 @@ async def run_task_command(interaction: discord.Interaction, since: str, until: 
         )
     except Exception as e:
         logger.error(f"Error in run_task_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -707,7 +1192,12 @@ async def run_task_for_user_command(
         )
     except Exception as e:
         logger.error(f"Error in run_task_for_user_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -733,7 +1223,12 @@ async def control_scheduler_command(
         )
     except Exception as e:
         logger.error(f"Error in control_scheduler_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -761,7 +1256,12 @@ async def get_ai_decisions_by_user_command(
             )
     except Exception as e:
         logger.error(f"Error in get_ai_decisions_by_user_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -786,7 +1286,12 @@ async def get_all_data_to_csv_command(interaction: discord.Interaction):
             )
     except Exception as e:
         logger.error(f"Error in get_all_data_to_csv_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -811,7 +1316,12 @@ async def get_blockchain_summary_command(interaction: discord.Interaction):
         await interaction.followup.send(discord_message, ephemeral=True)
     except Exception as e:
         logger.error(f"Error in get_blockchain_summary_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -839,7 +1349,12 @@ async def get_user_monthly_data_to_csv_command(
             )
     except Exception as e:
         logger.error(f"Error in get_user_monthly_data_to_csv_command: {e}")
-        await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                f"An error occurred: {e}", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
 
 
 @tree.command(
@@ -851,13 +1366,18 @@ async def delete_all_data_command(
     interaction: discord.Interaction, from_date: str, until_date: str
 ):
     try:
-        modal = UserDeletionModal(from_date=from_date, until_date=until_date)
+        modal = DeleteAllDataModal(from_date=from_date, until_date=until_date)
         await interaction.response.send_modal(modal)
     except Exception as e:
         logger.error(f"Error in delete_all_data_command: {e}")
-        await interaction.followup.send(
-            "Something went wrong while processing the command.", ephemeral=True
-        )
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "Something went wrong while processing the command.", ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                "Something went wrong while processing the command.", ephemeral=True
+            )
 
 
 # Helper Functions
